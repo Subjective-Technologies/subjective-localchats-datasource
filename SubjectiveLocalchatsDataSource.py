@@ -154,7 +154,22 @@ class SubjectiveLocalchatsDataSource(SubjectiveDataSource):
             "processed_sources": {
                 "type": "number",
                 "label": "Processed Sources",
-                "description": "Number of local transcript files that were parsed.",
+                "description": "Number of local transcript files that were parsed and exported in this run.",
+            },
+            "skipped_sources": {
+                "type": "number",
+                "label": "Skipped Sources",
+                "description": "Number of discovered files skipped because they were not newer than the last export watermark.",
+            },
+            "state_file": {
+                "type": "text",
+                "label": "State File",
+                "description": "JSON file storing the last exported source timestamp.",
+            },
+            "last_exported_source_timestamp": {
+                "type": "text",
+                "label": "Last Exported Source Timestamp",
+                "description": "UTC timestamp watermark used to export only newer files on subsequent runs.",
             },
             "warnings": {
                 "type": "list",
@@ -184,27 +199,46 @@ class SubjectiveLocalchatsDataSource(SubjectiveDataSource):
         additional_paths = self.additional_paths + self._csv_to_list(request.get("additional_paths", ""))
         max_files = self._to_int(request.get("max_files", self.max_files), default=self.max_files)
 
+        state_file = os.path.join(export_folder, "state.json")
+        state = self._load_state(state_file)
+        last_export_ts = self._to_float(state.get("last_exported_source_mtime"), default=0.0)
+
         candidates = self._discover_candidate_files(additional_paths, warnings)
+        candidates = sorted(candidates, key=lambda item: self._safe_mtime(item.get("path", "")))
+
+        incremental_candidates: List[Dict[str, str]] = []
+        skipped_sources = 0
+        for candidate in candidates:
+            source_mtime = self._safe_mtime(candidate.get("path", ""))
+            if source_mtime <= last_export_ts:
+                skipped_sources += 1
+                continue
+            incremental_candidates.append(candidate)
+
         if max_files > 0:
-            candidates = candidates[:max_files]
+            incremental_candidates = incremental_candidates[:max_files]
 
         exported_files: List[str] = []
         manifest_entries: List[Dict[str, Any]] = []
+        latest_processed_ts = last_export_ts
 
-        for candidate in candidates:
+        for candidate in incremental_candidates:
             try:
                 transcript = self._parse_candidate(candidate)
                 if not transcript or not transcript.get("messages"):
                     continue
 
+                source_mtime = self._safe_mtime(candidate.get("path", ""))
                 export_path = self._write_transcript(export_folder, transcript)
                 exported_files.append(export_path)
+                latest_processed_ts = max(latest_processed_ts, source_mtime)
 
                 manifest_entries.append(
                     {
                         "source_product": transcript.get("product"),
                         "source_kind": transcript.get("kind"),
                         "source_file": transcript.get("source_file"),
+                        "source_mtime": source_mtime,
                         "title": transcript.get("title"),
                         "message_count": len(transcript.get("messages") or []),
                         "export_file": export_path,
@@ -221,6 +255,9 @@ class SubjectiveLocalchatsDataSource(SubjectiveDataSource):
                 {
                     "generated_at": datetime.utcnow().isoformat() + "Z",
                     "processed_sources": len(manifest_entries),
+                    "skipped_sources": skipped_sources,
+                    "last_exported_source_mtime": latest_processed_ts,
+                    "last_exported_source_timestamp": self._format_utc_timestamp(latest_processed_ts),
                     "exported_files": exported_files,
                     "entries": manifest_entries,
                     "warnings": warnings,
@@ -229,11 +266,23 @@ class SubjectiveLocalchatsDataSource(SubjectiveDataSource):
                 indent=2,
             )
 
+        self._save_state(
+            state_file,
+            {
+                "last_exported_source_mtime": latest_processed_ts,
+                "last_exported_source_timestamp": self._format_utc_timestamp(latest_processed_ts),
+                "updated_at": datetime.utcnow().isoformat() + "Z",
+            },
+        )
+
         return {
             "context_folder": export_folder,
             "exported_files": exported_files,
             "manifest_file": manifest_file,
+            "state_file": state_file,
             "processed_sources": len(manifest_entries),
+            "skipped_sources": skipped_sources,
+            "last_exported_source_timestamp": self._format_utc_timestamp(latest_processed_ts),
             "warnings": warnings,
         }
 
@@ -498,6 +547,35 @@ class SubjectiveLocalchatsDataSource(SubjectiveDataSource):
                 return value["arguments"].strip()
 
         return ""
+
+    def _load_state(self, state_file: str) -> Dict[str, Any]:
+        try:
+            with open(state_file, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+            return payload if isinstance(payload, dict) else {}
+        except FileNotFoundError:
+            return {}
+        except Exception as exc:
+            BBLogger.log(f"Failed to load datasource state from {state_file}: {exc}")
+            return {}
+
+    def _save_state(self, state_file: str, state: Dict[str, Any]) -> None:
+        try:
+            with open(state_file, "w", encoding="utf-8") as handle:
+                json.dump(state, handle, indent=2)
+        except Exception as exc:
+            BBLogger.log(f"Failed to persist datasource state to {state_file}: {exc}")
+
+    def _format_utc_timestamp(self, value: float) -> str:
+        if value <= 0:
+            return ""
+        return datetime.utcfromtimestamp(value).isoformat() + "Z"
+
+    def _to_float(self, value: Any, default: float) -> float:
+        try:
+            return float(value)
+        except Exception:
+            return default
 
     def _write_transcript(self, export_folder: str, transcript: Dict[str, Any]) -> str:
         slug = self._slugify(transcript.get("title") or Path(transcript["source_file"]).stem)
