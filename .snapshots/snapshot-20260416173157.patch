@@ -1,20 +1,19 @@
---- SubjectiveLocalchatsDataSource.py (old)
-+++ SubjectiveLocalchatsDataSource.py (new)
-@@ -1,50 +1,166 @@
- import os
--from typing import Any
+--- .\SubjectiveLocalchatsDataSource.py (old)
++++ .\SubjectiveLocalchatsDataSource.py (new)
+@@ -0,0 +1,599 @@
++import os
 +import json
 +import glob
 +import hashlib
 +from datetime import datetime
 +from pathlib import Path
 +from typing import Any, Dict, Iterable, List, Optional, Tuple
- 
- from subjective_abstract_data_source_package import SubjectiveDataSource
- from brainboost_data_source_logger_package.BBLogger import BBLogger
- 
- 
- class SubjectiveLocalchatsDataSource(SubjectiveDataSource):
++
++from subjective_abstract_data_source_package import SubjectiveDataSource
++from brainboost_data_source_logger_package.BBLogger import BBLogger
++
++
++class SubjectiveLocalchatsDataSource(SubjectiveDataSource):
 +    """
 +    Datasource that discovers locally stored Codex / Claude chat transcripts
 +    (CLI and VS Code style locations), converts them to readable text, and
@@ -30,11 +29,9 @@
 +    TEXT_EXTENSIONS = {".jsonl", ".json", ".md", ".txt", ".log"}
 +    MAX_FILE_BYTES = 25 * 1024 * 1024
 +
-     def __init__(self, **kwargs):
-         super().__init__(**kwargs)
-         conn = getattr(self, "_connection", {}) or {}
--        self.example_connection_value = conn.get("example_connection_value") or self.params.get(
--            "example_connection_value", ""
++    def __init__(self, **kwargs):
++        super().__init__(**kwargs)
++        conn = getattr(self, "_connection", {}) or {}
 +        self.additional_paths = self._csv_to_list(
 +            conn.get("additional_paths") or self.params.get("additional_paths", "")
 +        )
@@ -59,18 +56,11 @@
 +        )
 +        self.filename_prefix = (
 +            conn.get("filename_prefix") or self.params.get("filename_prefix") or "chat"
-         )
- 
-     @classmethod
-     def connection_schema(cls) -> dict:
-         return {
--            "example_connection_value": {
--                "type": "text",
--                "label": "Example Connection Value",
--                "description": "Replace this with datasource-specific connection fields.",
--                "required": False,
--                "placeholder": "Customize the scaffold for your datasource",
--            }
++        )
++
++    @classmethod
++    def connection_schema(cls) -> dict:
++        return {
 +            "include_codex": {
 +                "type": "boolean",
 +                "label": "Include Codex",
@@ -120,18 +110,11 @@
 +                "required": False,
 +                "default": 4000,
 +            },
-         }
- 
-     @classmethod
-     def request_schema(cls) -> dict:
-         return {
--            "text": {
--                "type": "text",
--                "label": "Text",
--                "description": "Example per-request input. Replace or remove it as needed.",
--                "required": False,
--                "placeholder": "Enter request data",
--            }
++        }
++
++    @classmethod
++    def request_schema(cls) -> dict:
++        return {
 +            "context_folder": {
 +                "type": "text",
 +                "label": "Context Folder",
@@ -151,16 +134,11 @@
 +                "description": "Override the configured processing limit for this run.",
 +                "required": False,
 +            },
-         }
- 
-     @classmethod
-     def output_schema(cls) -> dict:
-         return {
--            "result": {
--                "type": "text",
--                "label": "Result",
--                "description": "Example output field returned by run().",
--            }
++        }
++
++    @classmethod
++    def output_schema(cls) -> dict:
++        return {
 +            "context_folder": {
 +                "type": "text",
 +                "label": "Context Folder",
@@ -186,19 +164,20 @@
 +                "label": "Warnings",
 +                "description": "Any discovery or parsing warnings generated during the run.",
 +            },
-         }
- 
-     @classmethod
-@@ -59,9 +175,425 @@
- 
-     def run(self, request: dict) -> Any:
-         request = request or {}
--        text = (
--            request.get("text")
--            or self.example_connection_value
--            or "Replace run() with your datasource logic."
--        )
--        return {"result": text}
++        }
++
++    @classmethod
++    def icon(cls) -> str:
++        icon_path = os.path.join(os.path.dirname(__file__), "icon.svg")
++        try:
++            with open(icon_path, "r", encoding="utf-8") as handle:
++                return handle.read()
++        except Exception as exc:
++            BBLogger.log(f"Error reading icon file: {exc}")
++            return ""
++
++    def run(self, request: dict) -> Any:
++        request = request or {}
 +        warnings: List[str] = []
 +
 +        context_root = self._resolve_context_folder(request)
@@ -621,4 +600,3 @@
 +        while "--" in slug:
 +            slug = slug.replace("--", "-")
 +        return slug[:80] or "chat"
-
