@@ -52,7 +52,7 @@ class SubjectiveLocalchatsDataSource(SubjectiveDataSource):
             or "local_chats"
         )
         self.filename_prefix = (
-            conn.get("filename_prefix") or self.params.get("filename_prefix") or "chat"
+            conn.get("filename_prefix") or self.params.get("filename_prefix") or "context"
         )
 
     @classmethod
@@ -578,33 +578,45 @@ class SubjectiveLocalchatsDataSource(SubjectiveDataSource):
             return default
 
     def _write_transcript(self, export_folder: str, transcript: Dict[str, Any]) -> str:
-        slug = self._slugify(transcript.get("title") or Path(transcript["source_file"]).stem)
-        digest = hashlib.sha1(transcript["source_file"].encode("utf-8", errors="ignore")).hexdigest()[:10]
-        filename = f"{self.filename_prefix}_{transcript.get('product', 'unknown')}_{slug}_{digest}.txt"
+        source_file = transcript.get("source_file") or ""
+        source_mtime = self._safe_mtime(source_file)
+        timestamp_label = self._format_compact_timestamp(source_mtime) or datetime.utcnow().strftime("%Y%m%d%H%M%S")
+        digest = hashlib.sha1(source_file.encode("utf-8", errors="ignore")).hexdigest()[:10]
+        filename = f"{self.filename_prefix}-{timestamp_label}-{digest}.json"
         export_path = os.path.join(export_folder, filename)
 
-        lines = [
-            f"Title: {transcript.get('title') or 'Untitled chat'}",
-            f"Product: {transcript.get('product')}",
-            f"Kind: {transcript.get('kind')}",
-            f"Source file: {transcript.get('source_file')}",
-            "",
+        title = transcript.get("title") or Path(source_file).stem or "Untitled chat"
+        messages = [
+            {
+                "role": (message.get("role") or "unknown"),
+                "timestamp": message.get("timestamp"),
+                "text": (message.get("text") or "").rstrip(),
+            }
+            for message in (transcript.get("messages") or [])
         ]
 
-        for index, message in enumerate(transcript.get("messages") or [], start=1):
-            role = (message.get("role") or "unknown").strip()
-            timestamp = str(message.get("timestamp") or "").strip()
-            header = f"[{index}] {role}"
-            if timestamp:
-                header += f" @ {timestamp}"
-            lines.append(header)
-            lines.append(message.get("text", "").rstrip())
-            lines.append("")
+        context_data = {
+            "type": "localchat",
+            "title": title,
+            "chat_name": title,
+            "product": transcript.get("product"),
+            "kind": transcript.get("kind"),
+            "source_file": source_file,
+            "source_mtime": source_mtime,
+            "source_timestamp": self._format_utc_timestamp(source_mtime),
+            "message_count": len(messages),
+            "messages": messages,
+        }
 
         with open(export_path, "w", encoding="utf-8") as handle:
-            handle.write("\n".join(lines).strip() + "\n")
+            json.dump(context_data, handle, indent=2, ensure_ascii=False)
 
         return export_path
+
+    def _format_compact_timestamp(self, value: float) -> str:
+        if value <= 0:
+            return ""
+        return datetime.utcfromtimestamp(value).strftime("%Y%m%d%H%M%S")
 
     def _resolve_context_folder(self, request: Dict[str, Any]) -> str:
         candidates = [
