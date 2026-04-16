@@ -1,0 +1,623 @@
+--- .\SubjectiveLocalchatsDataSource.py (old)
++++ .\SubjectiveLocalchatsDataSource.py (new)
+@@ -1,50 +1,166 @@
+ import os
+-from typing import Any
++import json
++import glob
++import hashlib
++from datetime import datetime
++from pathlib import Path
++from typing import Any, Dict, Iterable, List, Optional, Tuple
+ 
+ from subjective_abstract_data_source_package import SubjectiveDataSource
+ from brainboost_data_source_logger_package.BBLogger import BBLogger
+ 
+ 
+ class SubjectiveLocalchatsDataSource(SubjectiveDataSource):
++    """
++    Datasource that discovers locally stored Codex / Claude chat transcripts
++    (CLI and VS Code style locations), converts them to readable text, and
++    exports them into the context folder.
++
++    Design goals:
++    - zero external dependencies
++    - safe best-effort parsing for JSON / JSONL / plain text logs
++    - broad path discovery for Windows / Linux / macOS
++    - output readable .txt files plus an index.json manifest
++    """
++
++    TEXT_EXTENSIONS = {".jsonl", ".json", ".md", ".txt", ".log"}
++    MAX_FILE_BYTES = 25 * 1024 * 1024
++
+     def __init__(self, **kwargs):
+         super().__init__(**kwargs)
+         conn = getattr(self, "_connection", {}) or {}
+-        self.example_connection_value = conn.get("example_connection_value") or self.params.get(
+-            "example_connection_value", ""
++        self.additional_paths = self._csv_to_list(
++            conn.get("additional_paths") or self.params.get("additional_paths", "")
++        )
++        self.include_codex = self._to_bool(
++            conn.get("include_codex", self.params.get("include_codex", True))
++        )
++        self.include_claude = self._to_bool(
++            conn.get("include_claude", self.params.get("include_claude", True))
++        )
++        self.max_files = self._to_int(
++            conn.get("max_files", self.params.get("max_files", 500)),
++            default=500,
++        )
++        self.max_messages_per_chat = self._to_int(
++            conn.get("max_messages_per_chat", self.params.get("max_messages_per_chat", 4000)),
++            default=4000,
++        )
++        self.export_subfolder = (
++            conn.get("export_subfolder")
++            or self.params.get("export_subfolder")
++            or "local_chats"
++        )
++        self.filename_prefix = (
++            conn.get("filename_prefix") or self.params.get("filename_prefix") or "chat"
+         )
+ 
+     @classmethod
+     def connection_schema(cls) -> dict:
+         return {
+-            "example_connection_value": {
+-                "type": "text",
+-                "label": "Example Connection Value",
+-                "description": "Replace this with datasource-specific connection fields.",
+-                "required": False,
+-                "placeholder": "Customize the scaffold for your datasource",
+-            }
++            "include_codex": {
++                "type": "boolean",
++                "label": "Include Codex",
++                "description": "Discover locally stored Codex CLI / editor chat logs.",
++                "required": False,
++                "default": True,
++            },
++            "include_claude": {
++                "type": "boolean",
++                "label": "Include Claude",
++                "description": "Discover locally stored Claude CLI / editor chat logs.",
++                "required": False,
++                "default": True,
++            },
++            "additional_paths": {
++                "type": "text",
++                "label": "Additional Paths",
++                "description": "Comma-separated folders or files to scan in addition to the built-in locations.",
++                "required": False,
++                "placeholder": "/data/chatlogs, C:\\Users\\me\\AppData\\Roaming\\Claude",
++            },
++            "export_subfolder": {
++                "type": "text",
++                "label": "Context Export Subfolder",
++                "description": "Subfolder that will be created inside the resolved context folder.",
++                "required": False,
++                "placeholder": "local_chats",
++            },
++            "filename_prefix": {
++                "type": "text",
++                "label": "Filename Prefix",
++                "description": "Prefix used for exported transcript files.",
++                "required": False,
++                "placeholder": "chat",
++            },
++            "max_files": {
++                "type": "number",
++                "label": "Maximum Files",
++                "description": "Maximum number of candidate local transcript files to process.",
++                "required": False,
++                "default": 500,
++            },
++            "max_messages_per_chat": {
++                "type": "number",
++                "label": "Maximum Messages Per Chat",
++                "description": "Safety guard for extremely large transcript files.",
++                "required": False,
++                "default": 4000,
++            },
+         }
+ 
+     @classmethod
+     def request_schema(cls) -> dict:
+         return {
+-            "text": {
+-                "type": "text",
+-                "label": "Text",
+-                "description": "Example per-request input. Replace or remove it as needed.",
+-                "required": False,
+-                "placeholder": "Enter request data",
+-            }
++            "context_folder": {
++                "type": "text",
++                "label": "Context Folder",
++                "description": "Absolute or relative path where exported transcripts should be written.",
++                "required": False,
++                "placeholder": "./context",
++            },
++            "additional_paths": {
++                "type": "text",
++                "label": "Additional Paths",
++                "description": "Per-run comma-separated extra folders or files to scan.",
++                "required": False,
++            },
++            "max_files": {
++                "type": "number",
++                "label": "Maximum Files",
++                "description": "Override the configured processing limit for this run.",
++                "required": False,
++            },
+         }
+ 
+     @classmethod
+     def output_schema(cls) -> dict:
+         return {
+-            "result": {
+-                "type": "text",
+-                "label": "Result",
+-                "description": "Example output field returned by run().",
+-            }
++            "context_folder": {
++                "type": "text",
++                "label": "Context Folder",
++                "description": "Folder containing the exported transcript files.",
++            },
++            "exported_files": {
++                "type": "list",
++                "label": "Exported Files",
++                "description": "List of transcript files written to the context folder.",
++            },
++            "manifest_file": {
++                "type": "text",
++                "label": "Manifest File",
++                "description": "JSON manifest describing all exported chats.",
++            },
++            "processed_sources": {
++                "type": "number",
++                "label": "Processed Sources",
++                "description": "Number of local transcript files that were parsed.",
++            },
++            "warnings": {
++                "type": "list",
++                "label": "Warnings",
++                "description": "Any discovery or parsing warnings generated during the run.",
++            },
+         }
+ 
+     @classmethod
+@@ -59,9 +175,425 @@
+ 
+     def run(self, request: dict) -> Any:
+         request = request or {}
+-        text = (
+-            request.get("text")
+-            or self.example_connection_value
+-            or "Replace run() with your datasource logic."
+-        )
+-        return {"result": text}
++        warnings: List[str] = []
++
++        context_root = self._resolve_context_folder(request)
++        export_folder = os.path.join(context_root, self.export_subfolder)
++        os.makedirs(export_folder, exist_ok=True)
++
++        additional_paths = self.additional_paths + self._csv_to_list(request.get("additional_paths", ""))
++        max_files = self._to_int(request.get("max_files", self.max_files), default=self.max_files)
++
++        candidates = self._discover_candidate_files(additional_paths, warnings)
++        if max_files > 0:
++            candidates = candidates[:max_files]
++
++        exported_files: List[str] = []
++        manifest_entries: List[Dict[str, Any]] = []
++
++        for candidate in candidates:
++            try:
++                transcript = self._parse_candidate(candidate)
++                if not transcript or not transcript.get("messages"):
++                    continue
++
++                export_path = self._write_transcript(export_folder, transcript)
++                exported_files.append(export_path)
++
++                manifest_entries.append(
++                    {
++                        "source_product": transcript.get("product"),
++                        "source_kind": transcript.get("kind"),
++                        "source_file": transcript.get("source_file"),
++                        "title": transcript.get("title"),
++                        "message_count": len(transcript.get("messages") or []),
++                        "export_file": export_path,
++                    }
++                )
++            except Exception as exc:
++                warning = f"Failed to process {candidate.get('path')}: {exc}"
++                warnings.append(warning)
++                BBLogger.log(warning)
++
++        manifest_file = os.path.join(export_folder, "index.json")
++        with open(manifest_file, "w", encoding="utf-8") as handle:
++            json.dump(
++                {
++                    "generated_at": datetime.utcnow().isoformat() + "Z",
++                    "processed_sources": len(manifest_entries),
++                    "exported_files": exported_files,
++                    "entries": manifest_entries,
++                    "warnings": warnings,
++                },
++                handle,
++                indent=2,
++            )
++
++        return {
++            "context_folder": export_folder,
++            "exported_files": exported_files,
++            "manifest_file": manifest_file,
++            "processed_sources": len(manifest_entries),
++            "warnings": warnings,
++        }
++
++    def _discover_candidate_files(
++        self, additional_paths: List[str], warnings: List[str]
++    ) -> List[Dict[str, str]]:
++        discovered: List[Dict[str, str]] = []
++        seen: set = set()
++
++        for product, kind, pattern in self._candidate_globs(additional_paths):
++            for path in self._expand_glob(pattern):
++                if path in seen:
++                    continue
++                seen.add(path)
++                if not os.path.isfile(path):
++                    continue
++                if not self._is_supported_file(path):
++                    continue
++                try:
++                    if os.path.getsize(path) > self.MAX_FILE_BYTES:
++                        warnings.append(f"Skipping oversized file: {path}")
++                        continue
++                except OSError:
++                    continue
++
++                discovered.append({"product": product, "kind": kind, "path": path})
++
++        discovered.sort(key=lambda item: self._safe_mtime(item["path"]), reverse=True)
++        return discovered
++
++    def _candidate_globs(self, additional_paths: List[str]) -> List[Tuple[str, str, str]]:
++        home = os.path.expanduser("~")
++        patterns: List[Tuple[str, str, str]] = []
++
++        if self.include_codex:
++            patterns.extend(
++                [
++                    ("codex", "cli", os.path.join(home, ".codex", "sessions", "**", "*.jsonl")),
++                    ("codex", "cli", os.path.join(home, ".codex", "history.jsonl")),
++                    ("codex", "cli", os.path.join(home, ".config", "codex", "**", "*.jsonl")),
++                    (
++                        "codex",
++                        "vscode",
++                        os.path.join(home, "AppData", "Roaming", "Code", "User", "globalStorage", "**", "*codex*", "**", "*.json*"),
++                    ),
++                    (
++                        "codex",
++                        "vscode",
++                        os.path.join(home, ".config", "Code", "User", "globalStorage", "**", "*codex*", "**", "*.json*"),
++                    ),
++                    (
++                        "codex",
++                        "vscode",
++                        os.path.join(home, "Library", "Application Support", "Code", "User", "globalStorage", "**", "*codex*", "**", "*.json*"),
++                    ),
++                ]
++            )
++
++        if self.include_claude:
++            patterns.extend(
++                [
++                    ("claude", "cli", os.path.join(home, ".claude", "**", "*.jsonl")),
++                    ("claude", "cli", os.path.join(home, ".config", "claude", "**", "*.jsonl")),
++                    (
++                        "claude",
++                        "vscode",
++                        os.path.join(home, "AppData", "Roaming", "Code", "User", "globalStorage", "**", "*claude*", "**", "*.json*"),
++                    ),
++                    (
++                        "claude",
++                        "vscode",
++                        os.path.join(home, ".config", "Code", "User", "globalStorage", "**", "*claude*", "**", "*.json*"),
++                    ),
++                    (
++                        "claude",
++                        "vscode",
++                        os.path.join(home, "Library", "Application Support", "Code", "User", "globalStorage", "**", "*claude*", "**", "*.json*"),
++                    ),
++                ]
++            )
++
++        for custom_path in additional_paths:
++            if not custom_path:
++                continue
++            expanded = os.path.expandvars(os.path.expanduser(custom_path.strip()))
++            if os.path.isdir(expanded):
++                patterns.append(("custom", "manual", os.path.join(expanded, "**", "*")))
++            else:
++                patterns.append(("custom", "manual", expanded))
++
++        return patterns
++
++    def _expand_glob(self, pattern: str) -> List[str]:
++        return glob.glob(pattern, recursive=True)
++
++    def _is_supported_file(self, path: str) -> bool:
++        return Path(path).suffix.lower() in self.TEXT_EXTENSIONS
++
++    def _parse_candidate(self, candidate: Dict[str, str]) -> Optional[Dict[str, Any]]:
++        path = candidate["path"]
++        suffix = Path(path).suffix.lower()
++
++        if suffix == ".jsonl":
++            messages = self._parse_jsonl_messages(path)
++        elif suffix == ".json":
++            messages = self._parse_json_messages(path)
++        else:
++            messages = self._parse_plain_text(path)
++
++        messages = [m for m in messages if (m.get("text") or "").strip()]
++        if not messages:
++            return None
++
++        if self.max_messages_per_chat > 0:
++            messages = messages[: self.max_messages_per_chat]
++
++        title = self._derive_title(path, messages)
++        return {
++            "product": candidate.get("product"),
++            "kind": candidate.get("kind"),
++            "source_file": path,
++            "title": title,
++            "messages": messages,
++        }
++
++    def _parse_jsonl_messages(self, path: str) -> List[Dict[str, Any]]:
++        messages: List[Dict[str, Any]] = []
++        with open(path, "r", encoding="utf-8", errors="ignore") as handle:
++            for line_number, line in enumerate(handle, start=1):
++                line = line.strip()
++                if not line:
++                    continue
++                try:
++                    obj = json.loads(line)
++                except json.JSONDecodeError:
++                    messages.append(
++                        {
++                            "role": "unknown",
++                            "timestamp": None,
++                            "text": line,
++                            "source_line": line_number,
++                        }
++                    )
++                    continue
++                messages.extend(self._extract_messages_from_object(obj, fallback_timestamp=None))
++        return messages
++
++    def _parse_json_messages(self, path: str) -> List[Dict[str, Any]]:
++        with open(path, "r", encoding="utf-8", errors="ignore") as handle:
++            payload = json.load(handle)
++        return self._extract_messages_from_object(payload, fallback_timestamp=None)
++
++    def _parse_plain_text(self, path: str) -> List[Dict[str, Any]]:
++        with open(path, "r", encoding="utf-8", errors="ignore") as handle:
++            text = handle.read().strip()
++        if not text:
++            return []
++        return [{"role": "transcript", "timestamp": None, "text": text}]
++
++    def _extract_messages_from_object(
++        self, obj: Any, fallback_timestamp: Optional[str]
++    ) -> List[Dict[str, Any]]:
++        if obj is None:
++            return []
++
++        if isinstance(obj, list):
++            messages: List[Dict[str, Any]] = []
++            for item in obj:
++                messages.extend(self._extract_messages_from_object(item, fallback_timestamp))
++            return messages
++
++        if isinstance(obj, str):
++            text = obj.strip()
++            return [{"role": "unknown", "timestamp": fallback_timestamp, "text": text}] if text else []
++
++        if not isinstance(obj, dict):
++            return []
++
++        role = self._pick_first(obj, ["role", "speaker", "author", "type", "sender"])
++        timestamp = self._pick_first(
++            obj,
++            ["timestamp", "created_at", "updated_at", "time", "date", "ts"],
++            default=fallback_timestamp,
++        )
++        text = self._extract_text(obj)
++        if role and text:
++            return [{"role": str(role), "timestamp": timestamp, "text": text}]
++
++        for key in [
++            "messages",
++            "items",
++            "conversation",
++            "conversations",
++            "chat",
++            "chats",
++            "entries",
++            "transcript",
++            "turns",
++            "history",
++            "events",
++            "content",
++        ]:
++            if key in obj and isinstance(obj[key], (list, dict)):
++                return self._extract_messages_from_object(obj[key], timestamp)
++
++        extracted: List[Dict[str, Any]] = []
++        prompt_text = self._extract_text(obj.get("request")) or self._extract_text(obj.get("prompt"))
++        response_text = self._extract_text(obj.get("response")) or self._extract_text(obj.get("completion"))
++        if prompt_text:
++            extracted.append({"role": "user", "timestamp": timestamp, "text": prompt_text})
++        if response_text:
++            extracted.append({"role": "assistant", "timestamp": timestamp, "text": response_text})
++        if extracted:
++            return extracted
++
++        nested_messages: List[Dict[str, Any]] = []
++        for value in obj.values():
++            if isinstance(value, (list, dict)):
++                nested_messages.extend(self._extract_messages_from_object(value, timestamp))
++        return nested_messages
++
++    def _extract_text(self, value: Any) -> str:
++        if value is None:
++            return ""
++        if isinstance(value, str):
++            return value.strip()
++        if isinstance(value, (int, float, bool)):
++            return str(value)
++        if isinstance(value, list):
++            parts = [self._extract_text(item) for item in value]
++            return "\n".join([p for p in parts if p]).strip()
++        if isinstance(value, dict):
++            for key in [
++                "text",
++                "content",
++                "message",
++                "body",
++                "value",
++                "output_text",
++                "input_text",
++                "prompt",
++                "completion",
++            ]:
++                if key in value:
++                    text = self._extract_text(value[key])
++                    if text:
++                        return text
++
++            if "parts" in value:
++                return self._extract_text(value["parts"])
++
++            if "chunks" in value:
++                return self._extract_text(value["chunks"])
++
++            if value.get("type") in {"text", "input_text", "output_text"} and "text" in value:
++                return self._extract_text(value.get("text"))
++
++            if "delta" in value:
++                return self._extract_text(value["delta"])
++
++            if "arguments" in value and isinstance(value["arguments"], str):
++                return value["arguments"].strip()
++
++        return ""
++
++    def _write_transcript(self, export_folder: str, transcript: Dict[str, Any]) -> str:
++        slug = self._slugify(transcript.get("title") or Path(transcript["source_file"]).stem)
++        digest = hashlib.sha1(transcript["source_file"].encode("utf-8", errors="ignore")).hexdigest()[:10]
++        filename = f"{self.filename_prefix}_{transcript.get('product', 'unknown')}_{slug}_{digest}.txt"
++        export_path = os.path.join(export_folder, filename)
++
++        lines = [
++            f"Title: {transcript.get('title') or 'Untitled chat'}",
++            f"Product: {transcript.get('product')}",
++            f"Kind: {transcript.get('kind')}",
++            f"Source file: {transcript.get('source_file')}",
++            "",
++        ]
++
++        for index, message in enumerate(transcript.get("messages") or [], start=1):
++            role = (message.get("role") or "unknown").strip()
++            timestamp = str(message.get("timestamp") or "").strip()
++            header = f"[{index}] {role}"
++            if timestamp:
++                header += f" @ {timestamp}"
++            lines.append(header)
++            lines.append(message.get("text", "").rstrip())
++            lines.append("")
++
++        with open(export_path, "w", encoding="utf-8") as handle:
++            handle.write("\n".join(lines).strip() + "\n")
++
++        return export_path
++
++    def _resolve_context_folder(self, request: Dict[str, Any]) -> str:
++        candidates = [
++            request.get("context_folder"),
++            self.params.get("context_folder") if hasattr(self, "params") else None,
++            getattr(self, "context_folder", None),
++            os.path.join(os.getcwd(), "context"),
++        ]
++        for candidate in candidates:
++            if candidate:
++                path = os.path.abspath(os.path.expanduser(str(candidate)))
++                os.makedirs(path, exist_ok=True)
++                return path
++        fallback = os.path.abspath(os.path.join(os.getcwd(), "context"))
++        os.makedirs(fallback, exist_ok=True)
++        return fallback
++
++    def _derive_title(self, path: str, messages: List[Dict[str, Any]]) -> str:
++        first_user = next(
++            (m.get("text", "") for m in messages if str(m.get("role", "")).lower() in {"user", "human"}),
++            "",
++        )
++        if first_user:
++            title = " ".join(first_user.split())[:80].strip()
++            return title or Path(path).stem
++        return Path(path).stem
++
++    def _pick_first(self, obj: Dict[str, Any], keys: Iterable[str], default: Any = None) -> Any:
++        for key in keys:
++            if key in obj and obj[key] not in (None, "", []):
++                return obj[key]
++        return default
++
++    def _safe_mtime(self, path: str) -> float:
++        try:
++            return os.path.getmtime(path)
++        except OSError:
++            return 0.0
++
++    def _csv_to_list(self, value: Any) -> List[str]:
++        if value is None:
++            return []
++        if isinstance(value, list):
++            return [str(v).strip() for v in value if str(v).strip()]
++        return [part.strip() for part in str(value).split(",") if part.strip()]
++
++    def _to_bool(self, value: Any) -> bool:
++        if isinstance(value, bool):
++            return value
++        if value is None:
++            return False
++        return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
++
++    def _to_int(self, value: Any, default: int) -> int:
++        try:
++            return int(value)
++        except Exception:
++            return default
++
++    def _slugify(self, value: str) -> str:
++        cleaned = []
++        for char in str(value).lower():
++            if char.isalnum():
++                cleaned.append(char)
++            elif char in {" ", "-", "_"}:
++                cleaned.append("-")
++        slug = "".join(cleaned).strip("-")
++        while "--" in slug:
++            slug = slug.replace("--", "-")
++        return slug[:80] or "chat"
