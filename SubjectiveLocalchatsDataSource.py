@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import glob
 import hashlib
@@ -13,18 +14,18 @@ from brainboost_data_source_logger_package.BBLogger import BBLogger
 class SubjectiveLocalchatsDataSource(SubjectiveDataSource):
     """
     Datasource that discovers locally stored Codex / Claude chat transcripts
-    (CLI and VS Code style locations), converts them to readable text, and
-    exports them into the context folder.
+    (CLI and VS Code style locations) and exports one JSON context file per
+    chat into the framework-provided output directory.
 
     Design goals:
     - zero external dependencies
     - safe best-effort parsing for JSON / JSONL / plain text logs
     - broad path discovery for Windows / Linux / macOS
-    - output readable .txt files plus an index.json manifest
+    - one JSON per chat: top-level metadata + `messages` array
     """
 
     TEXT_EXTENSIONS = {".jsonl", ".json", ".md", ".txt", ".log"}
-    MAX_FILE_BYTES = 25 * 1024 * 1024
+    MAX_FILE_BYTES = 500 * 1024 * 1024
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -38,6 +39,9 @@ class SubjectiveLocalchatsDataSource(SubjectiveDataSource):
         self.include_claude = self._to_bool(
             conn.get("include_claude", self.params.get("include_claude", True))
         )
+        self.include_gemini = self._to_bool(
+            conn.get("include_gemini", self.params.get("include_gemini", True))
+        )
         self.max_files = self._to_int(
             conn.get("max_files", self.params.get("max_files", 500)),
             default=500,
@@ -49,7 +53,7 @@ class SubjectiveLocalchatsDataSource(SubjectiveDataSource):
         self.export_subfolder = (
             conn.get("export_subfolder")
             or self.params.get("export_subfolder")
-            or "local_chats"
+            or ""
         )
         self.filename_prefix = (
             conn.get("filename_prefix") or self.params.get("filename_prefix") or "context"
@@ -72,6 +76,13 @@ class SubjectiveLocalchatsDataSource(SubjectiveDataSource):
                 "required": False,
                 "default": True,
             },
+            "include_gemini": {
+                "type": "boolean",
+                "label": "Include Gemini",
+                "description": "Discover locally stored Gemini CLI / editor chat logs.",
+                "required": False,
+                "default": True,
+            },
             "additional_paths": {
                 "type": "text",
                 "label": "Additional Paths",
@@ -82,9 +93,9 @@ class SubjectiveLocalchatsDataSource(SubjectiveDataSource):
             "export_subfolder": {
                 "type": "text",
                 "label": "Context Export Subfolder",
-                "description": "Subfolder that will be created inside the resolved context folder.",
+                "description": "Optional subfolder within the resolved context folder. Leave blank to write per-chat files directly to the context folder.",
                 "required": False,
-                "placeholder": "local_chats",
+                "placeholder": "",
             },
             "filename_prefix": {
                 "type": "text",
@@ -135,48 +146,7 @@ class SubjectiveLocalchatsDataSource(SubjectiveDataSource):
 
     @classmethod
     def output_schema(cls) -> dict:
-        return {
-            "context_folder": {
-                "type": "text",
-                "label": "Context Folder",
-                "description": "Folder containing the exported transcript files.",
-            },
-            "exported_files": {
-                "type": "list",
-                "label": "Exported Files",
-                "description": "List of transcript files written to the context folder.",
-            },
-            "manifest_file": {
-                "type": "text",
-                "label": "Manifest File",
-                "description": "JSON manifest describing all exported chats.",
-            },
-            "processed_sources": {
-                "type": "number",
-                "label": "Processed Sources",
-                "description": "Number of local transcript files that were parsed and exported in this run.",
-            },
-            "skipped_sources": {
-                "type": "number",
-                "label": "Skipped Sources",
-                "description": "Number of discovered files skipped because they were not newer than the last export watermark.",
-            },
-            "state_file": {
-                "type": "text",
-                "label": "State File",
-                "description": "JSON file storing the last exported source timestamp.",
-            },
-            "last_exported_source_timestamp": {
-                "type": "text",
-                "label": "Last Exported Source Timestamp",
-                "description": "UTC timestamp watermark used to export only newer files on subsequent runs.",
-            },
-            "warnings": {
-                "type": "list",
-                "label": "Warnings",
-                "description": "Any discovery or parsing warnings generated during the run.",
-            },
-        }
+        return {}
 
     @classmethod
     def icon(cls) -> str:
@@ -193,98 +163,46 @@ class SubjectiveLocalchatsDataSource(SubjectiveDataSource):
         warnings: List[str] = []
 
         context_root = self._resolve_context_folder(request)
-        export_folder = os.path.join(context_root, self.export_subfolder)
+        export_folder = (
+            os.path.join(context_root, self.export_subfolder)
+            if self.export_subfolder
+            else context_root
+        )
         os.makedirs(export_folder, exist_ok=True)
 
         additional_paths = self.additional_paths + self._csv_to_list(request.get("additional_paths", ""))
         max_files = self._to_int(request.get("max_files", self.max_files), default=self.max_files)
 
-        state_file = os.path.join(export_folder, "state.json")
-        state = self._load_state(state_file)
-        last_export_ts = self._to_float(state.get("last_exported_source_mtime"), default=0.0)
-
         candidates = self._discover_candidate_files(additional_paths, warnings)
-        candidates = sorted(candidates, key=lambda item: self._safe_mtime(item.get("path", "")))
-
-        incremental_candidates: List[Dict[str, str]] = []
-        skipped_sources = 0
-        for candidate in candidates:
-            source_mtime = self._safe_mtime(candidate.get("path", ""))
-            if source_mtime <= last_export_ts:
-                skipped_sources += 1
-                continue
-            incremental_candidates.append(candidate)
-
+        candidates = sorted(
+            candidates,
+            key=lambda item: self._safe_mtime(item.get("path", "")),
+            reverse=True,
+        )
         if max_files > 0:
-            incremental_candidates = incremental_candidates[:max_files]
+            candidates = candidates[:max_files]
 
-        exported_files: List[str] = []
-        manifest_entries: List[Dict[str, Any]] = []
-        latest_processed_ts = last_export_ts
+        processed = 0
 
-        for candidate in incremental_candidates:
+        for candidate in candidates:
             try:
                 transcript = self._parse_candidate(candidate)
                 if not transcript or not transcript.get("messages"):
                     continue
 
-                source_mtime = self._safe_mtime(candidate.get("path", ""))
-                export_path = self._write_transcript(export_folder, transcript)
-                exported_files.append(export_path)
-                latest_processed_ts = max(latest_processed_ts, source_mtime)
-
-                manifest_entries.append(
-                    {
-                        "source_product": transcript.get("product"),
-                        "source_kind": transcript.get("kind"),
-                        "source_file": transcript.get("source_file"),
-                        "source_mtime": source_mtime,
-                        "title": transcript.get("title"),
-                        "message_count": len(transcript.get("messages") or []),
-                        "export_file": export_path,
-                    }
-                )
+                self._write_transcript(export_folder, transcript)
+                processed += 1
             except Exception as exc:
                 warning = f"Failed to process {candidate.get('path')}: {exc}"
                 warnings.append(warning)
                 BBLogger.log(warning)
 
-        manifest_file = os.path.join(export_folder, "index.json")
-        with open(manifest_file, "w", encoding="utf-8") as handle:
-            json.dump(
-                {
-                    "generated_at": datetime.utcnow().isoformat() + "Z",
-                    "processed_sources": len(manifest_entries),
-                    "skipped_sources": skipped_sources,
-                    "last_exported_source_mtime": latest_processed_ts,
-                    "last_exported_source_timestamp": self._format_utc_timestamp(latest_processed_ts),
-                    "exported_files": exported_files,
-                    "entries": manifest_entries,
-                    "warnings": warnings,
-                },
-                handle,
-                indent=2,
-            )
-
-        self._save_state(
-            state_file,
-            {
-                "last_exported_source_mtime": latest_processed_ts,
-                "last_exported_source_timestamp": self._format_utc_timestamp(latest_processed_ts),
-                "updated_at": datetime.utcnow().isoformat() + "Z",
-            },
+        BBLogger.log(
+            f"[SubjectiveLocalchatsDataSource] Exported {processed} chat context files to {export_folder} "
+            f"(warnings: {len(warnings)})"
         )
 
-        return {
-            "context_folder": export_folder,
-            "exported_files": exported_files,
-            "manifest_file": manifest_file,
-            "state_file": state_file,
-            "processed_sources": len(manifest_entries),
-            "skipped_sources": skipped_sources,
-            "last_exported_source_timestamp": self._format_utc_timestamp(latest_processed_ts),
-            "warnings": warnings,
-        }
+        return None
 
     def _discover_candidate_files(
         self, additional_paths: List[str], warnings: List[str]
@@ -364,6 +282,33 @@ class SubjectiveLocalchatsDataSource(SubjectiveDataSource):
                 ]
             )
 
+        if self.include_gemini:
+            patterns.extend(
+                [
+                    ("gemini", "cli", os.path.join(home, ".gemini", "tmp", "**", "logs.json")),
+                    ("gemini", "cli", os.path.join(home, ".gemini", "tmp", "**", "checkpoint-*.json")),
+                    ("gemini", "cli", os.path.join(home, ".gemini", "tmp", "**", "*.jsonl")),
+                    ("gemini", "cli", os.path.join(home, ".gemini", "sessions", "**", "*.json*")),
+                    ("gemini", "cli", os.path.join(home, ".gemini", "history", "**", "*.json*")),
+                    ("gemini", "cli", os.path.join(home, ".config", "gemini", "**", "*.json*")),
+                    (
+                        "gemini",
+                        "vscode",
+                        os.path.join(home, "AppData", "Roaming", "Code", "User", "globalStorage", "**", "*gemini*", "**", "*.json*"),
+                    ),
+                    (
+                        "gemini",
+                        "vscode",
+                        os.path.join(home, ".config", "Code", "User", "globalStorage", "**", "*gemini*", "**", "*.json*"),
+                    ),
+                    (
+                        "gemini",
+                        "vscode",
+                        os.path.join(home, "Library", "Application Support", "Code", "User", "globalStorage", "**", "*gemini*", "**", "*.json*"),
+                    ),
+                ]
+            )
+
         for custom_path in additional_paths:
             if not custom_path:
                 continue
@@ -400,12 +345,14 @@ class SubjectiveLocalchatsDataSource(SubjectiveDataSource):
             messages = messages[: self.max_messages_per_chat]
 
         title = self._derive_title(path, messages)
+        chat_started_at = self._chat_start_timestamp(path, messages)
         return {
             "product": candidate.get("product"),
             "kind": candidate.get("kind"),
             "source_file": path,
             "title": title,
             "messages": messages,
+            "chat_started_at": chat_started_at,
         }
 
     def _parse_jsonl_messages(self, path: str) -> List[Dict[str, Any]]:
@@ -548,41 +495,26 @@ class SubjectiveLocalchatsDataSource(SubjectiveDataSource):
 
         return ""
 
-    def _load_state(self, state_file: str) -> Dict[str, Any]:
-        try:
-            with open(state_file, "r", encoding="utf-8") as handle:
-                payload = json.load(handle)
-            return payload if isinstance(payload, dict) else {}
-        except FileNotFoundError:
-            return {}
-        except Exception as exc:
-            BBLogger.log(f"Failed to load datasource state from {state_file}: {exc}")
-            return {}
-
-    def _save_state(self, state_file: str, state: Dict[str, Any]) -> None:
-        try:
-            with open(state_file, "w", encoding="utf-8") as handle:
-                json.dump(state, handle, indent=2)
-        except Exception as exc:
-            BBLogger.log(f"Failed to persist datasource state to {state_file}: {exc}")
-
     def _format_utc_timestamp(self, value: float) -> str:
         if value <= 0:
             return ""
         return datetime.utcfromtimestamp(value).isoformat() + "Z"
 
-    def _to_float(self, value: Any, default: float) -> float:
-        try:
-            return float(value)
-        except Exception:
-            return default
-
     def _write_transcript(self, export_folder: str, transcript: Dict[str, Any]) -> str:
         source_file = transcript.get("source_file") or ""
-        source_mtime = self._safe_mtime(source_file)
-        timestamp_label = self._format_compact_timestamp(source_mtime) or datetime.utcnow().strftime("%Y%m%d%H%M%S")
+        chat_ts = float(transcript.get("chat_started_at") or 0.0)
+        if chat_ts <= 0:
+            chat_ts = self._safe_mtime(source_file)
+        timestamp_label = self._format_framework_timestamp(chat_ts)
+        if not timestamp_label:
+            timestamp_label = datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
         digest = hashlib.sha1(source_file.encode("utf-8", errors="ignore")).hexdigest()[:10]
-        filename = f"{self.filename_prefix}-{timestamp_label}-{digest}.json"
+        filename = self.build_context_filename(
+            datasource_name=self.get_data_source_type_name(),
+            connection_label=self._get_connection_label(),
+            output_format="json",
+            timestamp=f"{timestamp_label}_{digest}",
+        )
         export_path = os.path.join(export_folder, filename)
 
         title = transcript.get("title") or Path(source_file).stem or "Untitled chat"
@@ -602,8 +534,10 @@ class SubjectiveLocalchatsDataSource(SubjectiveDataSource):
             "product": transcript.get("product"),
             "kind": transcript.get("kind"),
             "source_file": source_file,
-            "source_mtime": source_mtime,
-            "source_timestamp": self._format_utc_timestamp(source_mtime),
+            "chat_started_at": chat_ts,
+            "chat_started_timestamp": self._format_utc_timestamp(chat_ts),
+            "source_mtime": self._safe_mtime(source_file),
+            "source_timestamp": self._format_utc_timestamp(self._safe_mtime(source_file)),
             "message_count": len(messages),
             "messages": messages,
         }
@@ -613,18 +547,78 @@ class SubjectiveLocalchatsDataSource(SubjectiveDataSource):
 
         return export_path
 
-    def _format_compact_timestamp(self, value: float) -> str:
+    def _format_framework_timestamp(self, value: float) -> str:
         if value <= 0:
             return ""
-        return datetime.utcfromtimestamp(value).strftime("%Y%m%d%H%M%S")
+        return datetime.utcfromtimestamp(value).strftime("%Y_%m_%d_%H_%M_%S")
+
+    def _chat_start_timestamp(self, source_file: str, messages: List[Dict[str, Any]]) -> float:
+        for message in messages:
+            ts = self._parse_any_timestamp(message.get("timestamp"))
+            if ts > 0:
+                return ts
+        ts = self._parse_timestamp_from_filename(source_file)
+        if ts > 0:
+            return ts
+        try:
+            return os.path.getctime(source_file)
+        except OSError:
+            return 0.0
+
+    def _parse_any_timestamp(self, value: Any) -> float:
+        if value is None or value == "":
+            return 0.0
+        if isinstance(value, bool):
+            return 0.0
+        if isinstance(value, (int, float)):
+            numeric = float(value)
+            if numeric > 1e12:
+                numeric /= 1000.0
+            return numeric if numeric > 0 else 0.0
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return 0.0
+            try:
+                cleaned = text.replace("Z", "+00:00")
+                return datetime.fromisoformat(cleaned).timestamp()
+            except Exception:
+                pass
+            try:
+                numeric = float(text)
+                if numeric > 1e12:
+                    numeric /= 1000.0
+                return numeric if numeric > 0 else 0.0
+            except ValueError:
+                pass
+        return 0.0
+
+    def _parse_timestamp_from_filename(self, source_file: str) -> float:
+        basename = os.path.basename(source_file)
+        match = re.search(
+            r"(\d{4})-(\d{2})-(\d{2})[T_](\d{2})[-:](\d{2})[-:](\d{2})",
+            basename,
+        )
+        if not match:
+            return 0.0
+        try:
+            parts = [int(p) for p in match.groups()]
+            return datetime(*parts).timestamp()
+        except (ValueError, OverflowError):
+            return 0.0
 
     def _resolve_context_folder(self, request: Dict[str, Any]) -> str:
         candidates = [
             request.get("context_folder"),
-            self.params.get("context_folder") if hasattr(self, "params") else None,
-            getattr(self, "context_folder", None),
-            os.path.join(os.getcwd(), "context"),
+            getattr(self, "output_dir", "") or "",
         ]
+        config = getattr(self, "_config", {}) or {}
+        for key in ("output_dir", "context_dir", "TARGET_DIRECTORY", "target_directory", "CONTEXT_DIR"):
+            value = config.get(key)
+            if value:
+                candidates.append(value)
+        if hasattr(self, "params") and isinstance(self.params, dict):
+            candidates.append(self.params.get("context_folder"))
         for candidate in candidates:
             if candidate:
                 path = os.path.abspath(os.path.expanduser(str(candidate)))
