@@ -3,6 +3,7 @@ import re
 import json
 import glob
 import hashlib
+import sqlite3
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -58,6 +59,7 @@ class SubjectiveLocalchatsDataSource(SubjectiveDataSource):
         self.filename_prefix = (
             conn.get("filename_prefix") or self.params.get("filename_prefix") or "context"
         )
+        self._codex_thread_index: Optional[Dict[str, Dict[str, Any]]] = None
 
     @classmethod
     def connection_schema(cls) -> dict:
@@ -505,6 +507,23 @@ class SubjectiveLocalchatsDataSource(SubjectiveDataSource):
         chat_ts = float(transcript.get("chat_started_at") or 0.0)
         if chat_ts <= 0:
             chat_ts = self._safe_mtime(source_file)
+
+        enrichment = (
+            self._codex_thread_for(source_file)
+            if transcript.get("product") == "codex"
+            else None
+        )
+
+        if enrichment:
+            for key in ("created_at_ms", "created_at", "updated_at_ms", "updated_at"):
+                ts_val = enrichment.get(key)
+                if not ts_val:
+                    continue
+                ts_float = float(ts_val) / 1000.0 if key.endswith("_ms") else float(ts_val)
+                if ts_float > 0:
+                    chat_ts = ts_float
+                    break
+
         timestamp_label = self._format_framework_timestamp(chat_ts)
         if not timestamp_label:
             timestamp_label = datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
@@ -518,6 +537,11 @@ class SubjectiveLocalchatsDataSource(SubjectiveDataSource):
         export_path = os.path.join(export_folder, filename)
 
         title = transcript.get("title") or Path(source_file).stem or "Untitled chat"
+        if enrichment:
+            real_title = (enrichment.get("title") or enrichment.get("first_user_message") or "").strip()
+            if real_title:
+                title = " ".join(real_title.split())[:120]
+
         messages = [
             {
                 "role": (message.get("role") or "unknown"),
@@ -542,10 +566,64 @@ class SubjectiveLocalchatsDataSource(SubjectiveDataSource):
             "messages": messages,
         }
 
+        if enrichment:
+            context_data["thread_id"] = enrichment.get("id")
+            context_data["model"] = enrichment.get("model")
+            context_data["git_branch"] = enrichment.get("git_branch")
+            context_data["git_sha"] = enrichment.get("git_sha")
+            context_data["cwd"] = enrichment.get("cwd")
+            context_data["archived"] = bool(enrichment.get("archived"))
+            context_data["tokens_used"] = enrichment.get("tokens_used")
+            context_data["source_surface"] = enrichment.get("source")
+
         with open(export_path, "w", encoding="utf-8") as handle:
             json.dump(context_data, handle, indent=2, ensure_ascii=False)
 
         return export_path
+
+    def _codex_thread_for(self, source_file: str) -> Optional[Dict[str, Any]]:
+        if not source_file:
+            return None
+        index = self._load_codex_thread_index()
+        if not index:
+            return None
+        key = os.path.normcase(os.path.normpath(source_file))
+        return index.get(key)
+
+    def _load_codex_thread_index(self) -> Dict[str, Dict[str, Any]]:
+        if self._codex_thread_index is not None:
+            return self._codex_thread_index
+
+        index: Dict[str, Dict[str, Any]] = {}
+        db_path = os.path.join(os.path.expanduser("~"), ".codex", "state_5.sqlite")
+        if not os.path.isfile(db_path):
+            self._codex_thread_index = index
+            return index
+
+        try:
+            uri = f"file:{db_path.replace(os.sep, '/')}?mode=ro"
+            conn = sqlite3.connect(uri, uri=True, timeout=2.0)
+            try:
+                cursor = conn.execute(
+                    "SELECT rollout_path, id, title, first_user_message, model, "
+                    "git_branch, git_sha, cwd, archived, source, tokens_used, "
+                    "created_at, updated_at, created_at_ms, updated_at_ms "
+                    "FROM threads"
+                )
+                columns = [c[0] for c in cursor.description]
+                for row in cursor.fetchall():
+                    record = dict(zip(columns, row))
+                    path = record.get("rollout_path")
+                    if not path:
+                        continue
+                    index[os.path.normcase(os.path.normpath(str(path)))] = record
+            finally:
+                conn.close()
+        except sqlite3.Error as exc:
+            BBLogger.log(f"Failed to read Codex thread index at {db_path}: {exc}")
+
+        self._codex_thread_index = index
+        return index
 
     def _format_framework_timestamp(self, value: float) -> str:
         if value <= 0:
@@ -628,14 +706,35 @@ class SubjectiveLocalchatsDataSource(SubjectiveDataSource):
         os.makedirs(fallback, exist_ok=True)
         return fallback
 
+    PREAMBLE_TAG_PREFIXES = (
+        "<environment_context",
+        "<user_instructions",
+        "<system-reminder",
+        "<system>",
+        "<tool_result",
+        "<tool_use",
+        "<context>",
+        "<metadata",
+    )
+
+    def _is_preamble_text(self, text: str) -> bool:
+        stripped = (text or "").lstrip()
+        if not stripped:
+            return True
+        lowered = stripped.lower()
+        return any(lowered.startswith(p) for p in self.PREAMBLE_TAG_PREFIXES)
+
     def _derive_title(self, path: str, messages: List[Dict[str, Any]]) -> str:
-        first_user = next(
-            (m.get("text", "") for m in messages if str(m.get("role", "")).lower() in {"user", "human"}),
-            "",
-        )
-        if first_user:
-            title = " ".join(first_user.split())[:80].strip()
-            return title or Path(path).stem
+        for message in messages:
+            role = str(message.get("role", "")).lower()
+            if role not in {"user", "human"}:
+                continue
+            text = message.get("text", "") or ""
+            if self._is_preamble_text(text):
+                continue
+            title = " ".join(text.split())[:80].strip()
+            if title:
+                return title
         return Path(path).stem
 
     def _pick_first(self, obj: Dict[str, Any], keys: Iterable[str], default: Any = None) -> Any:
