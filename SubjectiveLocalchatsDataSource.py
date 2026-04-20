@@ -14,9 +14,10 @@ from brainboost_data_source_logger_package.BBLogger import BBLogger
 
 class SubjectiveLocalchatsDataSource(SubjectiveDataSource):
     """
-    Datasource that discovers locally stored Codex / Claude chat transcripts
-    (CLI and VS Code style locations) and exports one JSON context file per
-    chat into the framework-provided output directory.
+    Datasource that discovers locally stored Codex / Claude / Gemini / Cursor chat
+    transcripts (CLI, VS Code-style locations, and Cursor Composer SQLite stores)
+    and exports one JSON context file per chat into the framework-provided output
+    directory.
 
     Design goals:
     - zero external dependencies
@@ -42,6 +43,9 @@ class SubjectiveLocalchatsDataSource(SubjectiveDataSource):
         )
         self.include_gemini = self._to_bool(
             conn.get("include_gemini", self.params.get("include_gemini", True))
+        )
+        self.include_cursor = self._to_bool(
+            conn.get("include_cursor", self.params.get("include_cursor", True))
         )
         self.max_files = self._to_int(
             conn.get("max_files", self.params.get("max_files", 500)),
@@ -82,6 +86,13 @@ class SubjectiveLocalchatsDataSource(SubjectiveDataSource):
                 "type": "boolean",
                 "label": "Include Gemini",
                 "description": "Discover locally stored Gemini CLI / editor chat logs.",
+                "required": False,
+                "default": True,
+            },
+            "include_cursor": {
+                "type": "boolean",
+                "label": "Include Cursor",
+                "description": "Discover locally stored Cursor Composer chats (SQLite) and agent transcript JSONL.",
                 "required": False,
                 "default": True,
             },
@@ -175,12 +186,19 @@ class SubjectiveLocalchatsDataSource(SubjectiveDataSource):
         additional_paths = self.additional_paths + self._csv_to_list(request.get("additional_paths", ""))
         max_files = self._to_int(request.get("max_files", self.max_files), default=self.max_files)
 
-        candidates = self._discover_candidate_files(additional_paths, warnings)
-        candidates = sorted(
-            candidates,
-            key=lambda item: self._safe_mtime(item.get("path", "")),
-            reverse=True,
-        )
+        file_candidates = self._discover_candidate_files(additional_paths, warnings)
+        cursor_composer_candidates = self._discover_cursor_composer_candidates(warnings)
+        combined: List[Tuple[float, Dict[str, str]]] = []
+        for item in file_candidates:
+            combined.append((self._safe_mtime(item.get("path", "")), item))
+        for item in cursor_composer_candidates:
+            cms = self._safe_float(item.get("cursor_created_ms"), 0.0)
+            score = cms / 1000.0
+            if score <= 0:
+                score = self._safe_mtime(item.get("path", "") or "")
+            combined.append((score, item))
+        combined.sort(key=lambda pair: pair[0], reverse=True)
+        candidates = [pair[1] for pair in combined]
         if max_files > 0:
             candidates = candidates[:max_files]
 
@@ -188,14 +206,20 @@ class SubjectiveLocalchatsDataSource(SubjectiveDataSource):
 
         for candidate in candidates:
             try:
-                transcript = self._parse_candidate(candidate)
+                if candidate.get("cursor_composer_id"):
+                    transcript = self._parse_cursor_composer_session(candidate)
+                else:
+                    transcript = self._parse_candidate(candidate)
                 if not transcript or not transcript.get("messages"):
                     continue
 
                 self._write_transcript(export_folder, transcript)
                 processed += 1
             except Exception as exc:
-                warning = f"Failed to process {candidate.get('path')}: {exc}"
+                label = candidate.get("path") or ""
+                if candidate.get("cursor_composer_id"):
+                    label = f"{label} composer:{candidate.get('cursor_composer_id')}"
+                warning = f"Failed to process {label}: {exc}"
                 warnings.append(warning)
                 BBLogger.log(warning)
 
@@ -232,6 +256,160 @@ class SubjectiveLocalchatsDataSource(SubjectiveDataSource):
 
         discovered.sort(key=lambda item: self._safe_mtime(item["path"]), reverse=True)
         return discovered
+
+    def _cursor_user_base_dirs(self) -> List[str]:
+        home = os.path.expanduser("~")
+        candidates = []
+        appdata = os.environ.get("APPDATA", "")
+        if appdata:
+            candidates.append(os.path.join(appdata, "Cursor", "User"))
+        candidates.append(os.path.join(home, ".config", "Cursor", "User"))
+        candidates.append(os.path.join(home, "Library", "Application Support", "Cursor", "User"))
+        candidates.append(os.path.join(home, ".cursor-server", "data", "User"))
+        seen: set = set()
+        resolved: List[str] = []
+        for path in candidates:
+            norm = os.path.normcase(os.path.normpath(path))
+            if norm in seen or not os.path.isdir(path):
+                continue
+            seen.add(norm)
+            resolved.append(path)
+        return resolved
+
+    def _cursor_global_state_db_paths(self) -> List[str]:
+        paths: List[str] = []
+        for base in self._cursor_user_base_dirs():
+            db_path = os.path.join(base, "globalStorage", "state.vscdb")
+            if os.path.isfile(db_path):
+                paths.append(db_path)
+        return paths
+
+    def _discover_cursor_composer_candidates(self, warnings: List[str]) -> List[Dict[str, str]]:
+        if not self.include_cursor:
+            return []
+        out: List[Dict[str, str]] = []
+        for db_path in self._cursor_global_state_db_paths():
+            uri = f"file:{db_path.replace(os.sep, '/')}?mode=ro"
+            try:
+                conn = sqlite3.connect(uri, uri=True, timeout=5.0)
+            except sqlite3.Error as exc:
+                warnings.append(f"Cursor Composer: could not open {db_path}: {exc}")
+                continue
+            try:
+                cur = conn.execute(
+                    "SELECT key, value FROM cursorDiskKV WHERE key LIKE 'composerData:%'"
+                )
+                for key, raw in cur.fetchall():
+                    if raw is None:
+                        continue
+                    try:
+                        payload = json.loads(raw)
+                    except (json.JSONDecodeError, TypeError):
+                        continue
+                    composer_id = str(payload.get("composerId") or "").strip()
+                    if not composer_id and isinstance(key, str) and key.startswith("composerData:"):
+                        composer_id = key.split(":", 1)[1].strip()
+                    if not composer_id:
+                        continue
+                    created = payload.get("createdAt")
+                    created_ms = 0.0
+                    if isinstance(created, (int, float)):
+                        created_ms = float(created)
+                    elif isinstance(created, str):
+                        ts = self._parse_any_timestamp(created)
+                        if ts > 0:
+                            created_ms = ts * 1000.0
+                    out.append(
+                        {
+                            "product": "cursor",
+                            "kind": "composer",
+                            "path": db_path,
+                            "cursor_composer_id": composer_id,
+                            "cursor_created_ms": str(int(created_ms)) if created_ms else "0",
+                        }
+                    )
+            except sqlite3.Error as exc:
+                warnings.append(f"Cursor Composer: query failed {db_path}: {exc}")
+            finally:
+                conn.close()
+        return out
+
+    def _cursor_bubble_role(self, bubble_type: Any) -> str:
+        if bubble_type == 1:
+            return "user"
+        if bubble_type == 2:
+            return "assistant"
+        return "unknown"
+
+    def _parse_cursor_composer_session(self, candidate: Dict[str, str]) -> Optional[Dict[str, Any]]:
+        db_path = candidate.get("path") or ""
+        composer_id = candidate.get("cursor_composer_id") or ""
+        if not db_path or not composer_id or not os.path.isfile(db_path):
+            return None
+        uri = f"file:{db_path.replace(os.sep, '/')}?mode=ro"
+        try:
+            conn = sqlite3.connect(uri, uri=True, timeout=5.0)
+        except sqlite3.Error:
+            return None
+        messages: List[Dict[str, Any]] = []
+        title_hint = ""
+        chat_started_ms = 0.0
+        try:
+            row = conn.execute(
+                "SELECT value FROM cursorDiskKV WHERE key = ?",
+                (f"composerData:{composer_id}",),
+            ).fetchone()
+            if row and row[0] is not None:
+                try:
+                    meta = json.loads(row[0])
+                    t = meta.get("text")
+                    if isinstance(t, str) and t.strip():
+                        title_hint = t.strip()
+                    created = meta.get("createdAt")
+                    if isinstance(created, (int, float)):
+                        chat_started_ms = float(created)
+                    elif isinstance(created, str):
+                        chat_started_ms = self._parse_any_timestamp(created) * 1000.0
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            cur = conn.execute(
+                "SELECT value FROM cursorDiskKV WHERE key LIKE ?",
+                (f"bubbleId:{composer_id}:%",),
+            )
+            for (raw,) in cur.fetchall():
+                if raw is None:
+                    continue
+                try:
+                    bubble = json.loads(raw)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                text = (bubble.get("text") or "").strip()
+                if not text:
+                    continue
+                role = self._cursor_bubble_role(bubble.get("type"))
+                ts = bubble.get("createdAt")
+                messages.append({"role": role, "timestamp": ts, "text": text})
+        finally:
+            conn.close()
+
+        messages.sort(key=lambda m: self._parse_any_timestamp(m.get("timestamp")))
+        if self.max_messages_per_chat > 0:
+            messages = messages[: self.max_messages_per_chat]
+        if not messages:
+            return None
+        virtual_path = f"{db_path}#composer:{composer_id}"
+        title = title_hint or self._derive_title(virtual_path, messages)
+        chat_started_at = chat_started_ms / 1000.0 if chat_started_ms > 0 else 0.0
+        if chat_started_at <= 0:
+            chat_started_at = self._chat_start_timestamp(virtual_path, messages)
+        return {
+            "product": candidate.get("product"),
+            "kind": candidate.get("kind"),
+            "source_file": virtual_path,
+            "title": title,
+            "messages": messages,
+            "chat_started_at": chat_started_at,
+        }
 
     def _candidate_globs(self, additional_paths: List[str]) -> List[Tuple[str, str, str]]:
         home = os.path.expanduser("~")
@@ -307,6 +485,17 @@ class SubjectiveLocalchatsDataSource(SubjectiveDataSource):
                         "gemini",
                         "vscode",
                         os.path.join(home, "Library", "Application Support", "Code", "User", "globalStorage", "**", "*gemini*", "**", "*.json*"),
+                    ),
+                ]
+            )
+
+        if self.include_cursor:
+            patterns.extend(
+                [
+                    (
+                        "cursor",
+                        "agent",
+                        os.path.join(home, ".cursor", "projects", "**", "agent-transcripts", "*.jsonl"),
                     ),
                 ]
             )
@@ -497,19 +686,45 @@ class SubjectiveLocalchatsDataSource(SubjectiveDataSource):
 
         return ""
 
+    def _path_for_fs_stat(self, path: str) -> str:
+        """Strip URI-style fragment (e.g. Cursor virtual source `db#composer:uuid`) for os.path ops."""
+        if not path or "#" not in path:
+            return path
+        return path.split("#", 1)[0]
+
+    def _safe_float(self, value: Any, default: float = 0.0) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    def _coerce_epoch_seconds(self, ts: float) -> float:
+        """Normalize ms/mixed encodings; avoid OSError from utcfromtimestamp on Windows."""
+        if ts <= 0 or ts != ts:
+            return 0.0
+        guard = 0
+        while ts > 1e11 and guard < 4:
+            ts /= 1000.0
+            guard += 1
+        return ts
+
     def _format_utc_timestamp(self, value: float) -> str:
+        value = self._coerce_epoch_seconds(self._safe_float(value, 0.0))
         if value <= 0:
             return ""
-        return datetime.utcfromtimestamp(value).isoformat() + "Z"
+        try:
+            return datetime.utcfromtimestamp(value).isoformat() + "Z"
+        except (OSError, OverflowError, ValueError):
+            return ""
 
     def _write_transcript(self, export_folder: str, transcript: Dict[str, Any]) -> str:
         source_file = transcript.get("source_file") or ""
-        chat_ts = float(transcript.get("chat_started_at") or 0.0)
+        chat_ts = self._coerce_epoch_seconds(self._safe_float(transcript.get("chat_started_at"), 0.0))
         if chat_ts <= 0:
-            chat_ts = self._safe_mtime(source_file)
+            chat_ts = self._safe_mtime(self._path_for_fs_stat(source_file))
 
         enrichment = (
-            self._codex_thread_for(source_file)
+            self._codex_thread_for(self._path_for_fs_stat(source_file))
             if transcript.get("product") == "codex"
             else None
         )
@@ -519,7 +734,11 @@ class SubjectiveLocalchatsDataSource(SubjectiveDataSource):
                 ts_val = enrichment.get(key)
                 if not ts_val:
                     continue
-                ts_float = float(ts_val) / 1000.0 if key.endswith("_ms") else float(ts_val)
+                try:
+                    ts_float = float(ts_val) / 1000.0 if key.endswith("_ms") else float(ts_val)
+                except (TypeError, ValueError):
+                    continue
+                ts_float = self._coerce_epoch_seconds(ts_float)
                 if ts_float > 0:
                     chat_ts = ts_float
                     break
@@ -560,8 +779,10 @@ class SubjectiveLocalchatsDataSource(SubjectiveDataSource):
             "source_file": source_file,
             "chat_started_at": chat_ts,
             "chat_started_timestamp": self._format_utc_timestamp(chat_ts),
-            "source_mtime": self._safe_mtime(source_file),
-            "source_timestamp": self._format_utc_timestamp(self._safe_mtime(source_file)),
+            "source_mtime": self._safe_mtime(self._path_for_fs_stat(source_file)),
+            "source_timestamp": self._format_utc_timestamp(
+                self._safe_mtime(self._path_for_fs_stat(source_file))
+            ),
             "message_count": len(messages),
             "messages": messages,
         }
@@ -582,6 +803,7 @@ class SubjectiveLocalchatsDataSource(SubjectiveDataSource):
         return export_path
 
     def _codex_thread_for(self, source_file: str) -> Optional[Dict[str, Any]]:
+        source_file = self._path_for_fs_stat(source_file)
         if not source_file:
             return None
         index = self._load_codex_thread_index()
@@ -626,9 +848,13 @@ class SubjectiveLocalchatsDataSource(SubjectiveDataSource):
         return index
 
     def _format_framework_timestamp(self, value: float) -> str:
+        value = self._coerce_epoch_seconds(self._safe_float(value, 0.0))
         if value <= 0:
             return ""
-        return datetime.utcfromtimestamp(value).strftime("%Y_%m_%d_%H_%M_%S")
+        try:
+            return datetime.utcfromtimestamp(value).strftime("%Y_%m_%d_%H_%M_%S")
+        except (OSError, OverflowError, ValueError):
+            return ""
 
     def _chat_start_timestamp(self, source_file: str, messages: List[Dict[str, Any]]) -> float:
         for message in messages:
@@ -638,8 +864,9 @@ class SubjectiveLocalchatsDataSource(SubjectiveDataSource):
         ts = self._parse_timestamp_from_filename(source_file)
         if ts > 0:
             return ts
+        fs_path = self._path_for_fs_stat(source_file)
         try:
-            return os.path.getctime(source_file)
+            return os.path.getctime(fs_path)
         except OSError:
             return 0.0
 
@@ -735,7 +962,8 @@ class SubjectiveLocalchatsDataSource(SubjectiveDataSource):
             title = " ".join(text.split())[:80].strip()
             if title:
                 return title
-        return Path(path).stem
+        stem_path = self._path_for_fs_stat(path)
+        return Path(stem_path).stem if stem_path else "Untitled chat"
 
     def _pick_first(self, obj: Dict[str, Any], keys: Iterable[str], default: Any = None) -> Any:
         for key in keys:
@@ -744,6 +972,7 @@ class SubjectiveLocalchatsDataSource(SubjectiveDataSource):
         return default
 
     def _safe_mtime(self, path: str) -> float:
+        path = self._path_for_fs_stat(path)
         try:
             return os.path.getmtime(path)
         except OSError:

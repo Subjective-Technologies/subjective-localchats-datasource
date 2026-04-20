@@ -1,89 +1,105 @@
 # Subjective Local Chats Data Source
 
-This datasource exports locally stored chat transcripts from developer tools into the Subjective context folder so they can be indexed and used as project context.
+This datasource finds **coding-assistant chat transcripts stored on your machine** (from CLIs and editors), normalizes them into a single shape, and writes **one JSON context file per chat** into your Subjective context folder so pipelines and retrieval can use them as project memory.
 
-## What it collects
+It is **local-only**: it reads files and local databases the tools already created. It does **not** call OpenAI, Anthropic, Google, or any other cloud API to download history.
 
-The datasource looks for locally executed chat/session logs from tools such as:
+## What it does
 
-- Codex CLI
-- Claude CLI
-- VS Code plugin or extension storage for Codex- or Claude-style chats
-- Additional folders you explicitly provide through datasource connection or request parameters
+1. **Discovers** candidate chat logs across a set of known paths for popular tools (see below), plus any extra folders you configure.
+2. **Parses** JSON, JSONL, or plain text using flexible heuristics (most vendors don't share one schema).
+3. **Normalizes** each session into a list of messages with `role`, optional `timestamp`, and `text`.
+4. **Exports** each session as a structured JSON document (metadata + `messages`) in the resolved context directory, using the framework’s context filename rules.
 
-It is designed for local/offline transcript discovery. It does not call provider APIs to fetch cloud chat history.
+Connection toggles let you turn sources on or off: **Codex**, **Claude**, **Gemini**, **Cursor**, plus **additional paths** for anything else you want scanned.
 
-## What it produces
+## How it works for most LLM / IDE tools
 
-When the datasource runs, it:
+Coding assistants generally store conversations in one of three ways. This plugin is built around that reality:
 
-1. Scans likely local storage locations for chat/session files
-2. Parses supported transcript formats such as JSON, JSONL, and plain text logs
-3. Extracts readable user/assistant conversation text where possible
-4. Writes normalized `.txt` transcript files into the resolved context export folder
-5. Writes an `index.json` manifest describing the exported items
+### 1. Log files (JSON / JSONL / text)
 
-## Supported inputs
+Many tools (CLI sessions, editor global storage, scratch logs) write **files** under the user profile or project folders: `.json`, `.jsonl`, `.md`, `.txt`, `.log`. Structures vary: arrays of turns, nested `messages`, `content`, `parts`, `events`, request/response pairs, etc.
 
-The implementation uses a best-effort parser and recognizes common patterns such as:
+The datasource uses a **single generic extractor** that walks those objects and pulls out human-readable text wherever it can recognize common patterns (message lists, content arrays, prompt/completion fields, and similar). That is why **one implementation can cover multiple vendors**: it targets the *shape* of stored chats, not one official API per model.
 
-- message arrays
-- event streams
-- JSONL records
-- nested `messages`, `content`, `parts`, or `text` fields
-- plain text log files
+### 2. VS Code–style `globalStorage`
 
-Because local tool formats vary by version, export quality depends on the structure of the stored files. Unknown or partial formats are skipped rather than failing the whole run.
+Extensions often persist state under paths like:
 
-## Discovery behavior
+`…/User/globalStorage/**/<vendor>/**/*.json`
 
-The datasource combines:
+The same glob-based discovery applies: if a file looks like chat JSON, it goes through the same parser.
 
-- built-in path guesses for common Codex and Claude local storage locations
-- optional extra scan roots passed in connection settings
-- optional per-request scan roots
+### 3. Cursor-specific: SQLite (`state.vscdb`)
 
-This makes it possible to support custom folders, portable installs, WSL/home-directory layouts, and editor-specific storage paths.
+**Cursor Composer** stores sessions in a local SQLite DB (`User/globalStorage/state.vscdb`, table `cursorDiskKV`):
 
-## Output structure
+- `composerData:*` rows hold session metadata.
+- `bubbleId:{sessionId}:*` rows hold per-message “bubbles.”
 
-Typical output:
+The datasource reads those rows, maps bubble types to user/assistant roles, orders by timestamps, and emits the **same normalized JSON** as file-based chats. It also picks up **agent transcript JSONL** under `~/.cursor/projects/**/agent-transcripts/` when Cursor is enabled.
 
-```text
-context/
-  local_chats/
-    codex_cli_2026-04-16_001.txt
-    claude_vscode_2026-04-16_002.txt
-    index.json
-```
+### 4. Codex-specific enrichment
 
-Each exported transcript contains:
+For **Codex** sessions tied to files on disk, the datasource can optionally merge metadata from Codex’s local SQLite thread index (`~/.codex/state_5.sqlite`) so titles and timestamps align with Codex’s own view of the session.
 
-- source product/kind when detected
-- source file path
-- session title when available
-- normalized conversation text
+### Why “most LLMs” and not literally every tool
 
-The manifest includes metadata such as source file, detected product, transcript title, export path, and timestamps when available.
+The plugin does **not** rely on each model having a public “export chats” API. It relies on **whatever the client app already saved locally**. Any new tool that writes similar JSON/JSONL or ends up under an extra path you add can be picked up without code changes, as long as the on-disk format is parseable by the generic extractor.
+
+Formats change between app versions; parsing is **best-effort**. Bad or empty extractions are skipped so one broken file does not fail the entire run.
+
+## What it collects (built-in sources)
+
+| Source   | Typical locations (simplified) |
+|----------|---------------------------------|
+| **Codex** | CLI under `~/.codex`, VS Code `globalStorage` areas with Codex-related paths |
+| **Claude** | CLI under `~/.claude` / config, VS Code `globalStorage` for Claude-related extensions |
+| **Gemini** | CLI under `~/.gemini`, VS Code `globalStorage` for Gemini-related paths |
+| **Cursor** | Composer: `Cursor/User/globalStorage/state.vscdb` (and remote-SSH layout under `~/.cursor-server` where applicable); agent JSONL under `~/.cursor/projects/**/agent-transcripts/` |
+
+Paths differ slightly on **Windows** (`%APPDATA%`), **Linux** (`~/.config`), and **macOS** (`Library/Application Support`). The implementation includes those variants.
+
+Use **Additional Paths** in the connection or request to include portable installs, WSL home directories, or any other folder that holds compatible logs.
+
+## Output
+
+Each successful chat becomes **one `.json` file** in the chosen context folder (optionally under an export subfolder). The payload includes at least:
+
+- `type`: `"localchat"`
+- `title` / `chat_name`
+- `product`, `kind` (e.g. cli, vscode, composer, agent)
+- `source_file` (for Cursor Composer this may be a virtual id like `…state.vscdb#composer:{uuid}`)
+- Timing fields where available
+- `messages`: array of `{ role, timestamp, text }`
+
+There is no separate mandatory `index.json` from this datasource; Subjective’s pipeline uses the exported context files themselves.
+
+## Connection options (summary)
+
+- **Include Codex / Claude / Gemini / Cursor**: enable or disable each family of built-in paths.
+- **Additional Paths**: comma-separated extra files or directories to scan.
+- **Context export subfolder / filename prefix**: organize output under the resolved context root.
+- **Max files / max messages per chat**: guardrails for very large machines or huge sessions.
 
 ## Typical use cases
 
-- Recover local AI coding conversations that are not visible in the provider web UI
-- Bring Codex/Claude local sessions into Subjective context for retrieval
-- Preserve project reasoning and implementation history from CLI/editor sessions
-- Audit or search earlier assistant suggestions made during local development
+- Bring **local** IDE and CLI chats into Subjective context for search and retrieval.
+- Preserve reasoning and code discussion that never appears in a web “chat history” UI.
+- Audit what the assistant suggested in past sessions on this machine.
 
 ## Limitations
 
-- It only exports chats that exist locally on disk and are readable by the current user
-- Provider/editor storage formats can change over time
-- Some sessions may contain incomplete metadata or fragmented content
-- Very large or obviously non-chat files are skipped for safety/performance
+- Only data that exists **locally** and is **readable** by the current user.
+- Storage layouts **change with app updates**; some sessions may export partially or not at all.
+- Very large files are skipped; Cursor DB rows with missing JSON are skipped.
+- Cursor must not exclusively lock SQLite while reading (best-effort; warnings if open fails).
 
-## Privacy notes
+## Privacy
 
-This datasource is intentionally local-first. It may export sensitive development conversations, prompts, file paths, and code snippets into the Subjective context folder. Review the resulting exports before sharing or syncing that folder.
+Exports may contain prompts, code, paths, and secrets from your chats. Treat the context folder like sensitive project data.
 
 ## Summary
 
-In short, this datasource turns locally stored Codex/Claude-style chat logs into plain text context documents plus a manifest, so Subjective can use them as searchable project memory.
+**Subjective Local Chats** turns **on-disk chat artifacts** from common AI coding tools into **normalized JSON transcripts** for Subjective. It works across **multiple LLM backends** because it follows how **clients** store sessions (files and local DBs), not because each provider exposes a single standard API.
