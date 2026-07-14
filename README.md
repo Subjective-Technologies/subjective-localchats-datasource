@@ -11,7 +11,7 @@ It is **local-only**: it reads files and local databases the tools already creat
 3. **Normalizes** each session into a list of messages with `role`, optional `timestamp`, and `text`.
 4. **Exports** each session as a structured JSON document (metadata + `messages`) in the resolved context directory, using the framework’s context filename rules.
 
-Connection toggles let you turn sources on or off: **Codex**, **Claude**, **Gemini**, **Cursor**, plus **additional paths** for anything else you want scanned.
+Connection toggles let you turn sources on or off: **Codex**, **Claude**, **Gemini**, **Cursor**, plus **additional paths** for anything else you want scanned. You can also add other readable user home folders so the same built-in discovery rules run against more than the current account.
 
 ## How it works for most LLM / IDE tools
 
@@ -63,6 +63,18 @@ Paths differ slightly on **Windows** (`%APPDATA%`), **Linux** (`~/.config`), and
 
 Use **Additional Paths** in the connection or request to include portable installs, WSL home directories, or any other folder that holds compatible logs.
 
+## Scanning other local users
+
+By default, the datasource scans the current user home plus other readable user homes discovered under common roots. To target specific local accounts, set **Other User Homes** to a comma-separated list of usernames or home paths, for example:
+
+`gordon, subjective, /home/gordon, /media/goldenthinker/Windows/Users/subjective`
+
+When you provide a username such as `gordon`, the datasource looks for a readable home directory under common roots including `/home`, `/Users`, `/mnt/*/Users`, and mounted Windows `Users` folders under `/media`.
+
+**Scan Accessible User Homes** controls the automatic broader scan. When enabled, it enumerates readable home directories under those same common roots and applies the built-in Codex, Claude, Gemini, and Cursor path discovery to each one. Unreadable or missing homes are skipped with warnings.
+
+Exports include `source_user` and `source_home` fields so transcripts from different local accounts can be distinguished.
+
 ## Output
 
 Each successful chat becomes **one `.json` file** in the chosen context folder (optionally under an export subfolder). The payload includes at least:
@@ -76,10 +88,24 @@ Each successful chat becomes **one `.json` file** in the chosen context folder (
 
 There is no separate mandatory `index.json` from this datasource; Subjective’s pipeline uses the exported context files themselves.
 
+### Incremental exports, continued chats, and idempotency
+
+The datasource keeps a small manifest named `.subjective_localchats_manifest.json` in the export folder. On each run, it compares each source chat's fingerprint against the previous run and skips sources that are unchanged and already have an exported JSON file.
+
+New chats and changed chats are parsed and written. When a chat **continues** (new lines in JSONL, new bubbles in Cursor, etc.), the backing file or database changes, so the next export contains the **updated** conversation.
+
+Export filenames are tied to a **stable session identity**: normalized start time (from transcript metadata, Codex thread enrichment, or the first message timestamp) plus a short hash of `source_file`. They **do not** use “now” or the source file’s modification time in the filename, so the same logical chat **overwrites the same context JSON** on each run instead of creating duplicates. If no start time can be inferred, the human-readable part of the filename is the fixed prefix `session` plus the same hash—still one file per source.
+
+The JSON field `source_mtime` / `source_timestamp` still reflects the file’s current modification time when relevant, so you can see when the backing store last changed.
+
+To force a full rebuild, delete `.subjective_localchats_manifest.json` from the export folder and run the datasource again.
+
 ## Connection options (summary)
 
 - **Include Codex / Claude / Gemini / Cursor**: enable or disable each family of built-in paths.
 - **Additional Paths**: comma-separated extra files or directories to scan.
+- **Other User Homes**: comma-separated usernames or home folder paths to scan using the built-in source layouts.
+- **Scan Accessible User Homes**: enabled by default; enumerates readable local user homes under common roots.
 - **Context export subfolder / filename prefix**: organize output under the resolved context root.
 - **Max files / max messages per chat**: guardrails for very large machines or huge sessions.
 
@@ -91,7 +117,7 @@ There is no separate mandatory `index.json` from this datasource; Subjective’s
 
 ## Limitations
 
-- Only data that exists **locally** and is **readable** by the current user.
+- Only data that exists **locally** and is **readable** by the current process/user.
 - Storage layouts **change with app updates**; some sessions may export partially or not at all.
 - Very large files are skipped; Cursor DB rows with missing JSON are skipped.
 - Cursor must not exclusively lock SQLite while reading (best-effort; warnings if open fails).
