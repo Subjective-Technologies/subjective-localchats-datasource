@@ -1,3 +1,5 @@
+<!-- Agent workflow is not this file. Read /subjective/AGENTS.md then /subjective/workflow/AGENTS.md. Class contract: libs/dependencies/subjective-abstract-data-source-package/AGENTS.md. This copy is plugin-local authoring notes. -->
+
 # V2 Datasource Authoring Instructions
 
 *Version: 2.0*
