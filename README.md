@@ -38,7 +38,7 @@ The same glob-based discovery applies: if a file looks like chat JSON, it goes t
 - `composerData:*` rows hold session metadata.
 - `bubbleId:{sessionId}:*` rows hold per-message “bubbles.”
 
-The datasource reads those rows, maps bubble types to user/assistant roles, orders by timestamps, and emits the **same normalized JSON** as file-based chats. It also picks up **agent transcript JSONL** under `~/.cursor/projects/**/agent-transcripts/` when Cursor is enabled.
+The datasource reads those rows, maps bubble types to user/assistant roles, orders by timestamps, and emits the **same normalized JSON** as file-based chats. It also picks up **agent transcript JSONL** recursively under `~/.cursor/projects/**/agent-transcripts/` when Cursor is enabled, including flat files, per-chat subfolders (`<chat-id>/<chat-id>.jsonl`), and nested subagent transcripts for every discovered user home.
 
 ### 4. Codex-specific enrichment
 

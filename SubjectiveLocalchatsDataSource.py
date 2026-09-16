@@ -715,7 +715,7 @@ class SubjectiveLocalchatsDataSource(SubjectiveDataSource):
                 add(
                     "cursor",
                     "agent",
-                    os.path.join(home, ".cursor", "projects", "**", "agent-transcripts", "*.jsonl"),
+                    os.path.join(home, ".cursor", "projects", "**", "agent-transcripts", "**", "*.jsonl"),
                     source_user,
                     home,
                 )
@@ -1011,7 +1011,8 @@ class SubjectiveLocalchatsDataSource(SubjectiveDataSource):
             if "chunks" in value:
                 return self._extract_text(value["chunks"])
 
-            if value.get("type") in {"text", "input_text", "output_text"} and "text" in value:
+            value_type = value.get("type")
+            if isinstance(value_type, str) and value_type in {"text", "input_text", "output_text"} and "text" in value:
                 return self._extract_text(value.get("text"))
 
             if "delta" in value:
